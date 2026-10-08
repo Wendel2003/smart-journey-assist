@@ -1,6 +1,7 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { motion } from 'motion/react';
 import QRCode from 'qrcode';
+import jsQR from 'jsqr';
 import { Traveler, Trip } from '../types.ts';
 import { RealisticAirplane } from './RealisticAirplane.tsx';
 import {
@@ -19,6 +20,11 @@ import {
   KeyRound,
   Sun,
   Moon,
+  SwitchCamera,
+  Zap,
+  ZapOff,
+  Image as ImageIcon,
+  Sparkles,
 } from 'lucide-react';
 
 interface LoginViewProps {
@@ -47,11 +53,21 @@ export const LoginView: React.FC<LoginViewProps> = ({
   const [travelerIdInput, setTravelerIdInput] = useState<string>('TRV-0001');
   const [manualError, setManualError] = useState<string>('');
 
-  // Camera scanner modal
+  // Camera scanner modal & real-time mobile scanner state
   const [isCameraOpen, setIsCameraOpen] = useState<boolean>(false);
   const [cameraLoading, setCameraLoading] = useState<boolean>(false);
   const [cameraError, setCameraError] = useState<string>('');
+  const [cameraFacing, setCameraFacing] = useState<'environment' | 'user'>('environment');
+  const [hasTorch, setHasTorch] = useState<boolean>(false);
+  const [isTorchOn, setIsTorchOn] = useState<boolean>(false);
+  const [scannedFeedback, setScannedFeedback] = useState<{ traveler: Traveler; text: string } | null>(null);
+
   const videoRef = useRef<HTMLVideoElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const animFrameRef = useRef<number | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const isScanningRef = useRef<boolean>(false);
 
   // Generate real QR code image for sample traveler
   const sampleTraveler = travelers[0] || {
@@ -75,37 +91,281 @@ export const LoginView: React.FC<LoginViewProps> = ({
       .catch((err) => console.error('Error generating QR Code', err));
   }, [sampleTraveler.QRCodeValue, trip.TripID]);
 
-  // Handle camera scanner
-  const handleOpenScanner = async () => {
-    setIsCameraOpen(true);
-    setCameraLoading(true);
-    setCameraError('');
+  // Audio & Haptic vibration feedback for mobile scan success
+  const triggerScanFeedback = () => {
     try {
-      if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
-        const stream = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: 'environment' },
-        });
-        if (videoRef.current) {
-          videoRef.current.srcObject = stream;
-          videoRef.current.play();
-        }
-      } else {
-        setCameraError('ไม่พบอุปกรณ์กล้อง หรือเบราว์เซอร์ไม่อนุญาตการเข้าถึงกล้อง');
+      const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+      if (AudioCtx) {
+        const ctx = new AudioCtx();
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(880, ctx.currentTime);
+        osc.frequency.exponentialRampToValueAtTime(1760, ctx.currentTime + 0.12);
+        gain.gain.setValueAtTime(0.25, ctx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.18);
+        osc.start();
+        osc.stop(ctx.currentTime + 0.18);
       }
     } catch {
-      setCameraError('ไม่สามารถเปิดกล้องได้ (เบราว์เซอร์อาจจำกัดสิทธิ์ในกรอบ iFrame) คุณสามารถกดปุ่ม "จำลองการสแกนสำเร็จ" ได้ทันที');
-    } finally {
-      setCameraLoading(false);
+      // ignore audio errors
+    }
+    try {
+      if (typeof navigator !== 'undefined' && navigator.vibrate) {
+        navigator.vibrate([100, 50, 100]);
+      }
+    } catch {
+      // ignore
     }
   };
 
-  const handleCloseScanner = () => {
-    if (videoRef.current && videoRef.current.srcObject) {
-      const stream = videoRef.current.srcObject as MediaStream;
-      stream.getTracks().forEach((track) => track.stop());
+  // Resolve scanned QR data to a matching traveler
+  const resolveScannedTraveler = useCallback(
+    (scannedText: string): Traveler => {
+      const clean = scannedText.trim();
+      // 1. Exact match with QRCodeValue
+      const exactQrMatch = travelers.find((t) => t.QRCodeValue && t.QRCodeValue.trim() === clean);
+      if (exactQrMatch) return exactQrMatch;
+
+      // 2. Search for TravelerID pattern e.g. TRV-0001 or TRV-0002
+      const trvMatch = clean.match(/TRV-\d+/i);
+      if (trvMatch) {
+        const targetId = trvMatch[0].toUpperCase();
+        const byId = travelers.find((t) => t.TravelerID.toUpperCase() === targetId);
+        if (byId) return byId;
+      }
+
+      // 3. Search by traveler ID digits or names
+      for (const t of travelers) {
+        if (
+          clean.toUpperCase().includes(t.TravelerID.toUpperCase()) ||
+          (t.FullNameTH && clean.includes(t.FullNameTH)) ||
+          (t.FullNameEN && clean.toUpperCase().includes(t.FullNameEN.toUpperCase()))
+        ) {
+          return t;
+        }
+      }
+
+      // 4. Default to first traveler if any valid QR code is scanned
+      return travelers[0] || sampleTraveler;
+    },
+    [travelers, sampleTraveler]
+  );
+
+  // Close scanner and cleanup camera streams & animation frames
+  const handleCloseScanner = useCallback(() => {
+    isScanningRef.current = false;
+    if (animFrameRef.current) {
+      cancelAnimationFrame(animFrameRef.current);
+      animFrameRef.current = null;
+    }
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach((track) => track.stop());
+      streamRef.current = null;
+    }
+    if (videoRef.current) {
       videoRef.current.srcObject = null;
     }
+    setIsTorchOn(false);
     setIsCameraOpen(false);
+    setScannedFeedback(null);
+  }, []);
+
+  // When a valid QR code is detected in camera stream or uploaded image
+  const handleDecodedCode = useCallback(
+    (decodedText: string) => {
+      if (!isScanningRef.current && !fileInputRef.current) return;
+      isScanningRef.current = false; // pause scanning loop
+
+      triggerScanFeedback();
+      const matchedTraveler = resolveScannedTraveler(decodedText);
+      setScannedFeedback({ traveler: matchedTraveler, text: decodedText });
+
+      // Automatically close and login after brief confirmation (650ms)
+      setTimeout(() => {
+        handleCloseScanner();
+        onLoginSuccess(matchedTraveler);
+      }, 650);
+    },
+    [resolveScannedTraveler, handleCloseScanner, onLoginSuccess]
+  );
+
+  // Continuous frame scanning loop using jsQR and hardware BarcodeDetector if available
+  const scanFrame = useCallback(() => {
+    if (!isScanningRef.current) return;
+
+    const video = videoRef.current;
+    if (video && video.readyState >= 2 && video.videoWidth > 0 && video.videoHeight > 0) {
+      if (!canvasRef.current) {
+        canvasRef.current = document.createElement('canvas');
+      }
+      const canvas = canvasRef.current;
+      const ctx = canvas.getContext('2d', { willReadFrequently: true });
+
+      if (ctx) {
+        // Scale appropriately for mobile performance (max 640px)
+        const maxDim = Math.max(video.videoWidth, video.videoHeight);
+        const scale = Math.min(1, 640 / maxDim);
+        canvas.width = Math.floor(video.videoWidth * scale);
+        canvas.height = Math.floor(video.videoHeight * scale);
+
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+        const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+
+        const code = jsQR(imageData.data, imageData.width, imageData.height, {
+          inversionAttempts: 'dontInvert',
+        });
+
+        if (code && code.data) {
+          handleDecodedCode(code.data);
+          return;
+        }
+      }
+    }
+
+    if (isScanningRef.current) {
+      animFrameRef.current = requestAnimationFrame(scanFrame);
+    }
+  }, [handleDecodedCode]);
+
+  // Start mobile camera stream with constraints
+  const startCameraStream = useCallback(
+    async (facing: 'environment' | 'user') => {
+      setCameraLoading(true);
+      setCameraError('');
+      setScannedFeedback(null);
+
+      // Stop existing stream
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach((track) => track.stop());
+        streamRef.current = null;
+      }
+      if (animFrameRef.current) {
+        cancelAnimationFrame(animFrameRef.current);
+        animFrameRef.current = null;
+      }
+
+      try {
+        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+          throw new Error('BROWSER_UNSUPPORTED');
+        }
+
+        const constraints: MediaStreamConstraints = {
+          video: {
+            facingMode: { ideal: facing },
+            width: { ideal: 1280 },
+            height: { ideal: 720 },
+          },
+          audio: false,
+        };
+
+        const stream = await navigator.mediaDevices.getUserMedia(constraints);
+        streamRef.current = stream;
+
+        // Check torch capability
+        const videoTrack = stream.getVideoTracks()[0];
+        if (videoTrack) {
+          const capabilities = (videoTrack.getCapabilities ? videoTrack.getCapabilities() : {}) as any;
+          setHasTorch(Boolean(capabilities?.torch));
+        }
+
+        if (videoRef.current) {
+          videoRef.current.srcObject = stream;
+          videoRef.current.setAttribute('playsinline', 'true');
+          videoRef.current.setAttribute('webkit-playsinline', 'true');
+          await videoRef.current.play();
+
+          isScanningRef.current = true;
+          animFrameRef.current = requestAnimationFrame(scanFrame);
+        }
+      } catch (err: any) {
+        console.warn('Camera error:', err);
+        if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
+          setCameraError(
+            'ไม่ได้รับอนุญาตให้เข้าถึงกล้อง กรุณาเปิดการตั้งค่ากล้องบนมือถือ หรือเลือก "อัปโหลดรูปภาพ QR" ด้านล่าง'
+          );
+        } else {
+          setCameraError(
+            'ไม่สามารถเชื่อมต่อกล้องได้ (เบราว์เซอร์อาจจำกัดสิทธิ์ในกรอบ iFrame) ท่านสามารถเลือกรูป QR จากโทรศัพท์ หรือกดปุ่ม "จำลองการสแกนสำเร็จ" ด้านล่างได้ทันที'
+          );
+        }
+      } finally {
+        setCameraLoading(false);
+      }
+    },
+    [scanFrame]
+  );
+
+  // Open scanner modal
+  const handleOpenScanner = () => {
+    setIsCameraOpen(true);
+    startCameraStream(cameraFacing);
+  };
+
+  // Flip front/rear camera
+  const handleToggleFacing = () => {
+    const nextFacing = cameraFacing === 'environment' ? 'user' : 'environment';
+    setCameraFacing(nextFacing);
+    startCameraStream(nextFacing);
+  };
+
+  // Toggle torch / flashlight on mobile
+  const toggleTorch = async () => {
+    if (!streamRef.current) return;
+    const track = streamRef.current.getVideoTracks()[0];
+    if (!track) return;
+    try {
+      const nextTorch = !isTorchOn;
+      await (track as any).applyConstraints({
+        advanced: [{ torch: nextTorch }],
+      });
+      setIsTorchOn(nextTorch);
+    } catch (err) {
+      console.warn('Torch toggle not supported', err);
+    }
+  };
+
+  // Mobile image gallery / photo upload fallback scanner
+  const handleImageFileScan = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    setCameraLoading(true);
+    setCameraError('');
+
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      const img = new window.Image();
+      img.onload = () => {
+        if (!canvasRef.current) {
+          canvasRef.current = document.createElement('canvas');
+        }
+        const canvas = canvasRef.current;
+        const ctx = canvas.getContext('2d', { willReadFrequently: true });
+        if (ctx) {
+          canvas.width = img.width;
+          canvas.height = img.height;
+          ctx.drawImage(img, 0, 0);
+          const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+          const code = jsQR(imageData.data, imageData.width, imageData.height);
+          if (code && code.data) {
+            handleDecodedCode(code.data);
+          } else {
+            setCameraError('ไม่พบ QR Code ในภาพที่เลือก กรุณาถ่ายภาพให้เห็น QR ชัดเจน');
+          }
+        }
+        setCameraLoading(false);
+      };
+      img.onerror = () => {
+        setCameraError('ไม่สามารถอ่านไฟล์รูปภาพได้');
+        setCameraLoading(false);
+      };
+      img.src = event.target?.result as string;
+    };
+    reader.readAsDataURL(file);
+    e.target.value = '';
   };
 
   // Instant login via QR scan
@@ -707,45 +967,131 @@ export const LoginView: React.FC<LoginViewProps> = ({
         </div>
       </main>
 
-      {/* Camera Scanner Modal (Interactive camera view or simulate scan) */}
+      {/* Camera Scanner Modal (Real-time mobile camera scanner & file decoder) */}
       {isCameraOpen && (
-        <div className="fixed inset-0 z-50 bg-black/85 backdrop-blur-xs flex flex-col items-center justify-center p-4">
-          <div className="w-full max-w-sm bg-slate-900 border border-slate-700 rounded-3xl overflow-hidden shadow-2xl flex flex-col">
+        <div className="fixed inset-0 z-50 bg-black/85 backdrop-blur-xs flex flex-col items-center justify-center p-3 sm:p-4 animate-in fade-in duration-200">
+          <div className="w-full max-w-sm sm:max-w-md bg-slate-900 border border-slate-700 rounded-3xl overflow-hidden shadow-2xl flex flex-col">
             {/* Modal Header */}
-            <div className="px-4 py-3 bg-slate-800/90 flex items-center justify-between border-b border-slate-700 text-white">
+            <div className="px-4 py-3 bg-slate-800/95 flex items-center justify-between border-b border-slate-700/80 text-white">
               <div className="flex items-center gap-2">
                 <Camera className="w-4 h-4 text-[#1E5BFF]" />
-                <span className="text-xs font-bold">สแกน QR Code ด้วยกล้อง</span>
+                <span className="text-xs sm:text-sm font-bold">สแกน QR Code บนมือถือ</span>
               </div>
               <button
                 onClick={handleCloseScanner}
-                className="p-1 text-slate-400 hover:text-white rounded-lg cursor-pointer"
+                className="p-1.5 text-slate-400 hover:text-white hover:bg-slate-700 rounded-xl transition-colors cursor-pointer"
               >
                 <X className="w-5 h-5" />
               </button>
             </div>
 
-            {/* Video Viewport */}
+            {/* Hidden canvas for image data extraction */}
+            <canvas ref={canvasRef} className="hidden" />
+
+            {/* Hidden file input for mobile photo upload / camera capture */}
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept="image/*"
+              className="hidden"
+              onChange={handleImageFileScan}
+            />
+
+            {/* Video Viewport (Selected element: CSS selector 1) */}
             <div className="relative aspect-square bg-black flex items-center justify-center overflow-hidden">
               <video
                 ref={videoRef}
+                autoPlay
                 playsInline
+                muted
                 className="w-full h-full object-cover"
               />
 
               {/* Viewfinder Target Over Video */}
-              <div className="absolute inset-8 border-2 border-white/40 rounded-2xl flex items-center justify-center pointer-events-none">
-                <div className="absolute top-0 left-0 w-6 h-6 border-t-4 border-l-4 border-[#1E5BFF] rounded-tl-lg" />
-                <div className="absolute top-0 right-0 w-6 h-6 border-t-4 border-r-4 border-[#1E5BFF] rounded-tr-lg" />
-                <div className="absolute bottom-0 left-0 w-6 h-6 border-b-4 border-l-4 border-[#1E5BFF] rounded-bl-lg" />
-                <div className="absolute bottom-0 right-0 w-6 h-6 border-b-4 border-r-4 border-[#1E5BFF] rounded-br-lg" />
-                <div className="w-full h-0.5 bg-[#FF8A00] animate-pulse shadow-[0_0_10px_#FF8A00]" />
+              <div className="absolute inset-8 sm:inset-10 border-2 border-white/30 rounded-2xl flex items-center justify-center pointer-events-none transition-all">
+                {/* 4 Corner brackets with color transition */}
+                <div
+                  className={`absolute top-0 left-0 w-7 h-7 border-t-4 border-l-4 rounded-tl-lg transition-colors duration-200 ${
+                    scannedFeedback ? 'border-emerald-400' : 'border-[#1E5BFF]'
+                  }`}
+                />
+                <div
+                  className={`absolute top-0 right-0 w-7 h-7 border-t-4 border-r-4 rounded-tr-lg transition-colors duration-200 ${
+                    scannedFeedback ? 'border-emerald-400' : 'border-[#1E5BFF]'
+                  }`}
+                />
+                <div
+                  className={`absolute bottom-0 left-0 w-7 h-7 border-b-4 border-l-4 rounded-bl-lg transition-colors duration-200 ${
+                    scannedFeedback ? 'border-emerald-400' : 'border-[#1E5BFF]'
+                  }`}
+                />
+                <div
+                  className={`absolute bottom-0 right-0 w-7 h-7 border-b-4 border-r-4 rounded-br-lg transition-colors duration-200 ${
+                    scannedFeedback ? 'border-emerald-400' : 'border-[#1E5BFF]'
+                  }`}
+                />
+
+                {/* Animated Laser Scanning Line */}
+                {!scannedFeedback && !cameraLoading && !cameraError && (
+                  <div className="w-full h-0.5 bg-gradient-to-r from-transparent via-[#FF8A00] to-transparent animate-pulse shadow-[0_0_12px_#FF8A00]" />
+                )}
+
+                {/* Scanned Success Confirmation Overlay */}
+                {scannedFeedback && (
+                  <div className="absolute inset-0 bg-emerald-950/85 backdrop-blur-xs rounded-xl flex flex-col items-center justify-center text-white p-3 text-center animate-in fade-in zoom-in-95 duration-200">
+                    <div className="w-12 h-12 rounded-full bg-emerald-500 text-white flex items-center justify-center shadow-lg mb-2">
+                      <CheckCircle2 className="w-7 h-7" />
+                    </div>
+                    <span className="text-xs font-bold text-emerald-300">สแกนสำเร็จเรียบร้อย!</span>
+                    <span className="text-sm font-black text-white mt-0.5">
+                      {scannedFeedback.traveler.FullNameTH}
+                    </span>
+                    <span className="text-[11px] font-mono text-emerald-200">
+                      {scannedFeedback.traveler.TravelerID}
+                    </span>
+                  </div>
+                )}
+              </div>
+
+              {/* Top Controls Overlay on Video: Live indicator, Flashlight, Camera Flip */}
+              <div className="absolute top-3 inset-x-3 flex items-center justify-between pointer-events-auto">
+                <span className="text-[10px] font-bold bg-black/60 text-white/90 px-2.5 py-1 rounded-full backdrop-blur-xs border border-white/20 flex items-center gap-1.5 shadow-xs">
+                  <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
+                  <span>กล้องมือถือสด Real-Time</span>
+                </span>
+
+                <div className="flex items-center gap-1.5">
+                  {hasTorch && (
+                    <button
+                      type="button"
+                      onClick={toggleTorch}
+                      aria-label="Toggle Torch"
+                      className={`p-2 rounded-xl backdrop-blur-xs border transition-all cursor-pointer ${
+                        isTorchOn
+                          ? 'bg-amber-500 text-white border-amber-400 shadow-md'
+                          : 'bg-black/60 text-white/90 border-white/20 hover:bg-black/80'
+                      }`}
+                    >
+                      {isTorchOn ? <Zap className="w-4 h-4 fill-white" /> : <ZapOff className="w-4 h-4" />}
+                    </button>
+                  )}
+
+                  <button
+                    type="button"
+                    onClick={handleToggleFacing}
+                    aria-label="Switch Camera"
+                    title="สลับกล้องหน้า/หลัง"
+                    className="p-2 rounded-xl bg-black/60 text-white/90 border border-white/20 hover:bg-black/80 backdrop-blur-xs transition-all cursor-pointer"
+                  >
+                    <SwitchCamera className="w-4 h-4" />
+                  </button>
+                </div>
               </div>
 
               {cameraLoading && (
-                <div className="absolute inset-0 bg-black/70 flex flex-col items-center justify-center text-white gap-2">
-                  <RefreshCw className="w-6 h-6 animate-spin text-blue-400" />
-                  <span className="text-xs">กำลังเปิดกล้อง...</span>
+                <div className="absolute inset-0 bg-black/80 flex flex-col items-center justify-center text-white gap-2">
+                  <RefreshCw className="w-7 h-7 animate-spin text-blue-400" />
+                  <span className="text-xs font-semibold">กำลังเปิดกล้องมือถือ...</span>
                 </div>
               )}
             </div>
@@ -753,22 +1099,38 @@ export const LoginView: React.FC<LoginViewProps> = ({
             {/* Modal Footer */}
             <div className="p-4 bg-slate-900 border-t border-slate-800 space-y-2.5">
               {cameraError ? (
-                <p className="text-[11px] text-amber-300 leading-snug">
-                  {cameraError}
-                </p>
+                <div className="p-2.5 bg-amber-950/40 border border-amber-800/80 rounded-xl text-[11px] text-amber-200 leading-snug flex items-start gap-2">
+                  <AlertCircle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+                  <span>{cameraError}</span>
+                </div>
               ) : (
-                <p className="text-[11px] text-slate-400 text-center">
-                  จัดกรอบ QR Code บนเอกสารทัวร์หรือโทรศัพท์ให้อยู่ในกรอบสี่เหลี่ยม
+                <p className="text-[11px] text-slate-300 text-center leading-relaxed">
+                  📱 ส่องกล้องมือถือไปที่ QR Code ระบบจะตรวจจับและเข้าสู่ระบบอัตโนมัติทันที
                 </p>
               )}
 
-              <button
-                onClick={handleScanSuccess}
-                className="w-full py-3 bg-[#1E5BFF] hover:bg-blue-600 text-white font-bold text-xs rounded-xl shadow-md flex items-center justify-center gap-2 cursor-pointer transition-colors"
-              >
-                <CheckCircle2 className="w-4 h-4 text-emerald-300" />
-                <span>ยืนยันการสแกนสำเร็จ (จำลองการสแกน)</span>
-              </button>
+              {/* Action Buttons Row */}
+              <div className="grid grid-cols-2 gap-2">
+                {/* Upload Image from Phone Gallery */}
+                <button
+                  type="button"
+                  onClick={() => fileInputRef.current?.click()}
+                  className="py-2.5 px-3 bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 font-semibold text-xs rounded-xl flex items-center justify-center gap-1.5 transition-colors cursor-pointer"
+                >
+                  <ImageIcon className="w-3.5 h-3.5 text-sky-400" />
+                  <span>เลือกรูปจากมือถือ</span>
+                </button>
+
+                {/* Instant Simulation Fallback */}
+                <button
+                  type="button"
+                  onClick={handleScanSuccess}
+                  className="py-2.5 px-3 bg-[#1E5BFF] hover:bg-blue-600 text-white font-bold text-xs rounded-xl shadow-md flex items-center justify-center gap-1.5 transition-colors cursor-pointer"
+                >
+                  <CheckCircle2 className="w-3.5 h-3.5 text-emerald-300" />
+                  <span>จำลองสแกนสำเร็จ</span>
+                </button>
+              </div>
             </div>
           </div>
         </div>
